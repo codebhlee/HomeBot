@@ -18,9 +18,10 @@ public static class AppConfiguration
         // 1. 환경변수 우선 읽기
         var settings = new AppSettings
         {
-            TelegramToken        = Environment.GetEnvironmentVariable("TELEGRAM_AI_HOME_BOT_TOKEN"),
-            OllamaBaseUrl        = Environment.GetEnvironmentVariable("OLLAMA_BASE_URL"),
-            OllamaEmbeddingModel = "nomic-embed-text",
+            TelegramToken            = Environment.GetEnvironmentVariable("TELEGRAM_AI_HOME_BOT_TOKEN"),
+            OllamaBaseUrl            = Environment.GetEnvironmentVariable("OLLAMA_BASE_URL"),
+            OllamaEmbeddingModel     = "nomic-embed-text",
+            PostgresConnectionString = Environment.GetEnvironmentVariable("POSTGRES_CONNECTION_STRING"),
         };
 
         // 2. appsettings.json 항상 읽어서 병합 (환경변수 없는 항목만 채움)
@@ -54,6 +55,13 @@ public static class AppConfiguration
                 settings.StableDiffusionEndpoints = config.StableDiffusionEndpoints ?? [];
                 Console.WriteLine($"[설정] SD 엔드포인트: {settings.StableDiffusionEndpoints.Length}개");
                 Console.WriteLine($"[설정] 임베딩 모델: {settings.OllamaEmbeddingModel}");
+
+                if (string.IsNullOrEmpty(settings.PostgresConnectionString))
+                {
+                    settings.PostgresConnectionString = config.PostgresConnectionString;
+                    Console.WriteLine("[설정] PostgreSQL 연결 문자열: appsettings.json");
+                }
+                else Console.WriteLine("[설정] PostgreSQL 연결 문자열: 환경변수");
             }
         }
         else
@@ -64,6 +72,9 @@ public static class AppConfiguration
         // 3. 필수값 검증
         if (string.IsNullOrEmpty(settings.TelegramToken))
             throw new InvalidOperationException("오류: TELEGRAM_AI_HOME_BOT_TOKEN이 환경변수와 appsettings.json 어디에도 없습니다.");
+
+        if (string.IsNullOrEmpty(settings.PostgresConnectionString))
+            throw new InvalidOperationException("오류: POSTGRES_CONNECTION_STRING이 환경변수와 appsettings.json 어디에도 없습니다.");
 
         settings.OllamaBaseUrl ??= "http://localhost:11434";
 

@@ -1,0 +1,15 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# PostgreSQL 데이터 볼륨 (docker-compose)
+Data/postgres/
+
+# 시크릿 — 실제 설정값 포함 가능, 절대 커밋 금지
+appsettings.json
+appsettings.local.json
+appsettings.*.json
+!appsettings.example.json

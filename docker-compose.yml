@@ -12,7 +12,7 @@ services:
     volumes:
       - ./Data/postgres:/var/lib/postgresql/data
       - ./Data/init:/docker-entrypoint-initdb.d:ro
-    Command:
+    command:
       # 대용량 처리를 위한 튜닝 파라미터 (선택사항)
       - "-c"
       - "max_connections=50"

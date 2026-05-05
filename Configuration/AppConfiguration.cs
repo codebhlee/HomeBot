@@ -22,6 +22,7 @@ public static class AppConfiguration
             OllamaBaseUrl            = Environment.GetEnvironmentVariable("OLLAMA_BASE_URL"),
             OllamaEmbeddingModel     = "nomic-embed-text",
             PostgresConnectionString = Environment.GetEnvironmentVariable("POSTGRES_CONNECTION_STRING"),
+            OpenWeatherApiKey        = Environment.GetEnvironmentVariable("OPENWEATHER_API_KEY"),
         };
 
         // 2. appsettings.json 항상 읽어서 병합 (환경변수 없는 항목만 채움)
@@ -62,6 +63,13 @@ public static class AppConfiguration
                     Console.WriteLine("[설정] PostgreSQL 연결 문자열: appsettings.json");
                 }
                 else Console.WriteLine("[설정] PostgreSQL 연결 문자열: 환경변수");
+
+                if (string.IsNullOrEmpty(settings.OpenWeatherApiKey))
+                {
+                    settings.OpenWeatherApiKey = config.OpenWeatherApiKey;
+                    Console.WriteLine("[설정] OpenWeather API 키: appsettings.json");
+                }
+                else Console.WriteLine("[설정] OpenWeather API 키: 환경변수");
             }
         }
         else

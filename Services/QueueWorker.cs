@@ -1,4 +1,5 @@
 using HomeBot.Models;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Telegram.Bot;
@@ -11,27 +12,28 @@ namespace HomeBot.Services;
 /// 동시성: SemaphoreSlim(3)으로 최대 3개 작업 병렬 처리.
 /// Graceful Shutdown: stoppingToken 발생 시 새 항목 추가를 막고
 /// 진행 중인 작업까지 모두 완료한 뒤 종료.
+/// ChatService는 Transient이므로 IServiceScopeFactory를 통해 매 작업마다 resolve.
 /// </summary>
 public sealed class QueueWorker : BackgroundService
 {
     private const int MaxConcurrency = 3;
 
-    private readonly ITaskQueue         _queue;
-    private readonly IChatService       _chatService;
-    private readonly IImageService      _imageService;
-    private readonly ITelegramBotClient _bot;
-    private readonly ILogger<QueueWorker> _logger;
-    private readonly SemaphoreSlim      _semaphore = new(MaxConcurrency, MaxConcurrency);
+    private readonly ITaskQueue            _queue;
+    private readonly IServiceScopeFactory  _scopeFactory;
+    private readonly IImageService         _imageService;
+    private readonly ITelegramBotClient    _bot;
+    private readonly ILogger<QueueWorker>  _logger;
+    private readonly SemaphoreSlim         _semaphore = new(MaxConcurrency, MaxConcurrency);
 
     public QueueWorker(
         ITaskQueue            queue,
-        IChatService          chatService,
+        IServiceScopeFactory  scopeFactory,
         IImageService         imageService,
         ITelegramBotClient    bot,
         ILogger<QueueWorker>  logger)
     {
         _queue        = queue;
-        _chatService  = chatService;
+        _scopeFactory = scopeFactory;
         _imageService = imageService;
         _bot          = bot;
         _logger       = logger;
@@ -79,15 +81,20 @@ public sealed class QueueWorker : BackgroundService
             switch (context.TaskType)
             {
                 case AITaskType.Chat:
-                    await _chatService.RespondAsync(
-                        _bot,
-                        context.ChatId,
-                        context.ModelName,
-                        context.Prompt,
-                        context.Temperature,
-                        context.NumPredict,
-                        context.CustomSystemPrompt,
-                        CancellationToken.None);
+                    // ChatService는 Transient — 매 작업마다 새 scope에서 resolve
+                    await using (var scope = _scopeFactory.CreateAsyncScope())
+                    {
+                        var chatService = scope.ServiceProvider.GetRequiredService<IChatService>();
+                        await chatService.RespondAsync(
+                            _bot,
+                            context.ChatId,
+                            context.ModelName,
+                            context.Prompt,
+                            context.Temperature,
+                            context.NumPredict,
+                            context.CustomSystemPrompt,
+                            CancellationToken.None);
+                    }
                     break;
 
                 case AITaskType.Image:

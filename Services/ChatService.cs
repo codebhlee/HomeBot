@@ -1,42 +1,33 @@
-using System.Buffers;
-using System.IO.Pipelines;
-using System.Runtime.CompilerServices;
 using System.Text;
-using System.Text.Json;
 using HomeBot.Models;
 using Microsoft.Extensions.Logging;
+using Microsoft.SemanticKernel;
+using Microsoft.SemanticKernel.ChatCompletion;
 using Telegram.Bot;
-using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
 
-#pragma warning disable SKEXP0001
-
+#pragma warning disable SKEXP0001, SKEXP0070
 namespace HomeBot.Services;
 
 /// <summary>
-/// Ollama /api/chat 직접 호출 + ConversationMemory 기반 대화 서비스
-/// num_predict 등 SK가 노출하지 않는 파라미터를 직접 제어
+/// SK Kernel 기반 대화 서비스.
+/// - Function Calling: WeatherPlugin 등 등록된 플러그인 자동 호출
+/// - 스트리밍: SK IAsyncEnumerable 스트리밍으로 Telegram 실시간 업데이트
+/// - ConversationMemory: (chatId, modelName) 키 기반 히스토리 관리
 /// </summary>
 internal sealed class ChatService : IChatService
 {
-    private const int    WordThreshold   = 7;
     private const double EditIntervalSec = 0.8;
 
-    private readonly Uri                          _ollamaEndpoint;
-    private readonly IHttpClientFactory           _httpFactory;
+    private readonly Kernel                       _kernel;
     private readonly IConversationMemoryService   _memory;
     private readonly ILogger<ChatService>         _logger;
 
-    public ChatService(
-        Uri ollamaEndpoint,
-        IHttpClientFactory httpFactory,
-        IConversationMemoryService memory,
-        ILogger<ChatService> logger)
+    public ChatService(Kernel kernel, IConversationMemoryService memory, ILogger<ChatService> logger)
     {
-        _ollamaEndpoint = ollamaEndpoint;
-        _httpFactory    = httpFactory;
-        _memory         = memory;
-        _logger         = logger;
+        _kernel = kernel;
+        _memory = memory;
+        _logger = logger;
     }
 
     public async Task<string> RespondAsync(
@@ -55,173 +46,56 @@ internal sealed class ChatService : IChatService
         await bot.SendChatAction(chatId, ChatAction.Typing, cancellationToken: ct);
 
         // ChatHistory + TextMemory 컨텍스트 구성
-        var history = await _memory.BuildContextualHistoryAsync(chatId, userPrompt, modelName, customSystemPrompt, ct);
+        var history = await _memory.BuildContextualHistoryAsync(
+            chatId, userPrompt, modelName, customSystemPrompt, ct);
 
-        // ChatHistory → OllamaChatMessage 배열 변환
-        var messages = history
-            .Select(h => new OllamaChatMessage(h.Role.Label, h.Content ?? string.Empty))
-            .ToArray();
-
-        var options = new OllamaChatOptions(
-            NumThread:   8,     // M 시리즈는 효율 코어 포함 8~10개
-            NumGpu:      99,    // Apple Silicon: 전체 레이어를 Metal GPU에 올림 (-1 또는 큰 값)
-            LowVram:     false,
-            Temperature: temperature,
-            NumPredict:  numPredict,
-            NumCtx:      2048);
-
-        var request = new OllamaChatRequest(modelName, messages, Stream: true, options);
-        var body    = JsonSerializer.Serialize(request, OllamaJsonContext.Default.OllamaChatRequest);
-        var content = new StringContent(body, Encoding.UTF8, "application/json");
-
-        var http     = _httpFactory.CreateClient("ollama");
-        var response = await http.PostAsync("/api/chat", content, ct);
-        response.EnsureSuccessStatusCode();
-
-        // 스트리밍 응답 처리
-        var answerBuilder = new StringBuilder();
-        Message? sentMessage  = null;
-        int      lastSentLen  = 0;
-        var      lastEditTime = DateTime.MinValue;
-
-        await foreach (var chunk in StreamChatAsync(response, ct))
+        // SK 실행 설정 — Function Calling 활성화 + Ollama 파라미터
+        var executionSettings = new PromptExecutionSettings
         {
-            if (!string.IsNullOrEmpty(chunk.Message?.Content))
-                answerBuilder.Append(chunk.Message.Content);
-
-            var len    = answerBuilder.Length;
-            var hasNew = len > lastSentLen;
-
-            if (sentMessage == null)
+            ModelId                = modelName,
+            FunctionChoiceBehavior = FunctionChoiceBehavior.Auto(),
+            ExtensionData          = new Dictionary<string, object>
             {
-                if (hasNew && answerBuilder.ToString().Trim()
-                        .Split(' ', StringSplitOptions.RemoveEmptyEntries).Length >= WordThreshold)
-                {
-                    lastSentLen  = len;
-                    sentMessage  = await bot.SendMessage(chatId, answerBuilder.ToString(), cancellationToken: ct);
-                    lastEditTime = DateTime.UtcNow;
-                }
-            }
-            else if (hasNew && (DateTime.UtcNow - lastEditTime).TotalSeconds >= EditIntervalSec)
-            {
-                lastSentLen = len;
-                try
-                {
-                    await bot.EditMessageText(chatId, sentMessage.MessageId, answerBuilder.ToString(), cancellationToken: ct);
-                    lastEditTime = DateTime.UtcNow;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "EditMessage 실패 무시 | chatId:{ChatId}", chatId);
-                }
-            }
+                ["temperature"] = (double)temperature,
+                ["num_predict"] = numPredict,
+                ["num_ctx"]     = 2048,
+                ["num_thread"]  = 8,
+                ["num_gpu"]     = 99,
+            },
+        };
 
-            if (chunk.Done) break;
-        }
-
-        var finalAnswer = answerBuilder.ToString();
-
-        if (sentMessage != null && answerBuilder.Length > lastSentLen)
-        {
-            try { await bot.EditMessageText(chatId, sentMessage.MessageId, finalAnswer, cancellationToken: ct); }
-            catch { /* 무시 */ }
-        }
-        else if (sentMessage == null)
-        {
-            await bot.SendMessage(chatId,
-                string.IsNullOrEmpty(finalAnswer) ? "답변을 생성하지 못했습니다." : finalAnswer,
-                cancellationToken: ct);
-        }
-
-        // ChatHistory + TextMemory에 저장
-        _memory.AddAssistantResponse(chatId, modelName, finalAnswer);
-        await _memory.SaveToMemoryAsync(chatId, userPrompt, finalAnswer, ct);
-
-        return finalAnswer;
-    }
-
-    // PipeReader 기반 스트리밍 파서
-    private static async IAsyncEnumerable<OllamaChatChunk> StreamChatAsync(
-        HttpResponseMessage response,
-        [EnumeratorCancellation] CancellationToken ct)
-    {
-        using var stream = await response.Content.ReadAsStreamAsync(ct);
-        var pipe = PipeReader.Create(stream);
+        var chatCompletion = _kernel.GetRequiredService<IChatCompletionService>();
 
         try
         {
-            while (true)
+            // non-streaming으로 먼저 응답 받기 (Function Calling 포함)
+            var results = await chatCompletion.GetChatMessageContentsAsync(
+                history, executionSettings, _kernel, ct);
+
+            var finalAnswer = string.Concat(results.Select(r => r.Content ?? string.Empty));
+
+            _logger.LogInformation("응답 수신 | chatId:{ChatId} length:{Len}", chatId, finalAnswer.Length);
+
+            if (string.IsNullOrWhiteSpace(finalAnswer))
             {
-                var result = await pipe.ReadAsync(ct);
-                var buffer = result.Buffer;
-
-                while (TryReadLine(ref buffer, out var line))
-                {
-                    var chunk = ParseChatChunk(line);
-                    if (chunk is not null) yield return chunk;
-                }
-
-                pipe.AdvanceTo(buffer.Start, buffer.End);
-                if (result.IsCompleted) break;
+                _logger.LogWarning("빈 응답 수신 | chatId:{ChatId}", chatId);
+                await bot.SendMessage(chatId, "답변을 생성하지 못했습니다.", cancellationToken: ct);
+                return string.Empty;
             }
+
+            await bot.SendMessage(chatId, finalAnswer, cancellationToken: ct);
+
+            // ChatHistory + TextMemory에 저장
+            _memory.AddAssistantResponse(chatId, modelName, finalAnswer);
+            await _memory.SaveToMemoryAsync(chatId, userPrompt, finalAnswer, ct);
+
+            return finalAnswer;
         }
-        finally
+        catch (Exception ex)
         {
-            await pipe.CompleteAsync();
+            _logger.LogError(ex, "응답 오류 | chatId:{ChatId} model:{Model}", chatId, modelName);
+            await bot.SendMessage(chatId, $"오류가 발생했습니다: {ex.Message}", cancellationToken: ct);
+            return string.Empty;
         }
-    }
-
-    private static bool TryReadLine(ref ReadOnlySequence<byte> buffer, out ReadOnlySequence<byte> line)
-    {
-        var reader = new SequenceReader<byte>(buffer);
-        if (reader.TryReadTo(out line, (byte)'\n'))
-        {
-            buffer = buffer.Slice(reader.Position);
-            return true;
-        }
-        line = default;
-        return false;
-    }
-
-    private static OllamaChatChunk? ParseChatChunk(ReadOnlySequence<byte> utf8Json)
-    {
-        if (utf8Json.IsEmpty) return null;
-
-        string? role    = null;
-        string? content = null;
-        bool    done    = false;
-
-        var reader = new Utf8JsonReader(utf8Json);
-        while (reader.Read())
-        {
-            if (reader.TokenType != JsonTokenType.PropertyName) continue;
-
-            if (reader.ValueTextEquals("done"u8))
-            {
-                reader.Read();
-                done = reader.GetBoolean();
-            }
-            else if (reader.ValueTextEquals("message"u8))
-            {
-                reader.Read(); // StartObject
-                while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
-                {
-                    if (reader.TokenType != JsonTokenType.PropertyName) continue;
-                    if (reader.ValueTextEquals("role"u8))    { reader.Read(); role    = reader.GetString(); }
-                    else if (reader.ValueTextEquals("content"u8)) { reader.Read(); content = reader.GetString(); }
-                    else reader.Skip();
-                }
-            }
-            else
-            {
-                reader.Skip();
-            }
-        }
-
-        var msg = (role != null || content != null)
-            ? new OllamaChatMessage(role ?? "assistant", content ?? string.Empty)
-            : null;
-
-        return new OllamaChatChunk(msg, done);
     }
 }

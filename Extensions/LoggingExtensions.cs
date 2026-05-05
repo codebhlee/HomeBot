@@ -11,7 +11,9 @@ internal static class LoggingExtensions
         {
             logging.ClearProviders();
             logging.AddConsole();
-            logging.SetMinimumLevel(LogLevel.Information);
+            logging.SetMinimumLevel(LogLevel.Debug);
+            // SK 내부 로그는 너무 많으므로 Warning 이상만
+            logging.AddFilter("Microsoft.SemanticKernel", LogLevel.Warning);
         });
 
         return services;

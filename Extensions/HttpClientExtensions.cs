@@ -19,6 +19,12 @@ internal static class HttpClientExtensions
             client.Timeout     = TimeSpan.FromMinutes(10);
         });
 
+        services.AddHttpClient("weather", client =>
+        {
+            client.BaseAddress = new Uri("https://api.openweathermap.org");
+            client.Timeout     = TimeSpan.FromSeconds(10);
+        });
+
         return services;
     }
 }

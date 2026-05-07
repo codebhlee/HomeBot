@@ -7,7 +7,7 @@ public static class AIModelTypeExtensions
     /// <summary>Ollama API에 전달할 모델명 문자열 반환</summary>
     public static string ToModelName(this AIModelType model) => model switch
     {
-        AIModelType.QwenCoder       => "qwen2.5-coder:7b",
+        AIModelType.QwenCoder       => "qwen2.5-coder:14b",
         AIModelType.Llama31Instruct => "llama3.1:8b-instruct-q8_0",
         AIModelType.StableDiffusion => "stable-diffusion",
         _                           => throw new ArgumentOutOfRangeException(nameof(model), model, null),
